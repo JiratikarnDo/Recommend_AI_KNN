@@ -32,10 +32,12 @@ def recommend(id):
     sql_query = "SELECT * FROM userpreferences"
     df = pd.read_sql(sql_query, conn)
     
+    # ดึงข้อมูล UserID , goalID, InterestGenderID
     sql_goal_gender = '''
     SELECT UserID, goalID, interestGenderID
     FROM user
     '''
+    
     goal_gender_df = pd.read_sql(sql_goal_gender, conn)
     df = pd.merge(df, goal_gender_df, on="UserID", how="left")
     df = pd.get_dummies(df, columns=["goalID", "interestGenderID"], prefix=["goal", "gender"])
