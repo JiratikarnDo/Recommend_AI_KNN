@@ -79,7 +79,7 @@ def recommend(id):
     recommended_users = list(set(knn_users))
     print(f"Raw KNN Users: {recommended_users}")
 
-    # กรองเฉพาะผู้ใช้ที่มีเพศตรงกับ interest_gender
+    # กรองเฉพาะผู้ใช้ที่มีเพศตรงกับ interest_gender ให้ตรง
     filtered_users = goal_gender_df[
         (goal_gender_df['UserID'].isin(recommended_users)) &
         (goal_gender_df['GenderID'] == interest_gender)
@@ -117,7 +117,7 @@ def recommend(id):
     recommended_users = list(set(recommended_users))[:5]
     print(f"Final Recommended Users: {recommended_users}")
 
-    # ===================== ดึงข้อมูลผู้ใช้ที่แนะนำ =====================
+    # ===================== ดึงข้อมูลผู้ใช้ที่แนะนำ ======================
     if not recommended_users:
         print("No sufficient users found!")
         return jsonify({"message": "No sufficient users found"}), 200
