@@ -23,110 +23,127 @@ def create_connection():
 
 # Path to the folder where images are stored
 IMAGE_FOLDER = os.path.join(os.getcwd(), 'assets', 'user')
-
 @app.route('/ai_v2/recommend/<int:id>', methods=['GET'])
 def recommend(id):
     conn = create_connection()
 
-    # ดึงข้อมูล Preferences และ Goal/InterestGender
+    # ===================== ดึงข้อมูล Preferences =====================
     sql_preferences = '''
     SELECT UserID, PreferenceID
     FROM userpreferences
     '''
     preferences_df = pd.read_sql(sql_preferences, conn)
+    print("Preferences Data Loaded:")
+    print(preferences_df.head())  # Debug
 
-    # ทำ Pivot Table สำหรับ PreferenceID
+    # Pivot Table สำหรับ PreferenceID
     preferences_pivot = preferences_df.pivot_table(index='UserID', columns='PreferenceID', aggfunc='size', fill_value=0)
+    print("Preferences Pivot Table:")
+    print(preferences_pivot.head())  # Debug
 
-    # ดึงข้อมูล UserID, goalID, InterestGenderID
+    # ===================== ดึงข้อมูล GoalID และ Gender =====================
     sql_goal_gender = '''
-    SELECT UserID, goalID, interestGenderID
+    SELECT UserID, goalID, interestGenderID, GenderID
     FROM user
     '''
     goal_gender_df = pd.read_sql(sql_goal_gender, conn)
+    print("Goal and Gender Data Loaded:")
+    print(goal_gender_df.head())  # Debug
 
-    # ทำ One-Hot Encoding ให้ goalID และ interestGenderID
-    goal_gender_df = pd.get_dummies(goal_gender_df, columns=["goalID", "interestGenderID"], prefix=["goal", "gender"])
+    # ตรวจสอบ UserID
+    if id not in goal_gender_df['UserID'].values:
+        print(f"UserID {id} not found!")
+        return jsonify({"error": f"UserID {id} not found"}), 404
 
-    # รวม Features Preference, goalID และ interestGenderID
+    # ดึง InterestGenderID และเพศของผู้ใช้งาน
+    user_info = goal_gender_df.loc[goal_gender_df['UserID'] == id].iloc[0]
+    interest_gender = user_info['interestGenderID']
+    print(f"User {id} Info: GenderID={user_info['GenderID']}, InterestGenderID={interest_gender}")  # Debug
+
+    # รวม Preferences และ GoalID
+    goal_gender_df = pd.get_dummies(goal_gender_df, columns=["goalID"], prefix="goal")
     final_df = preferences_pivot.join(goal_gender_df.set_index('UserID'), on='UserID', how='left')
+    print("Final Combined DataFrame:")
+    print(final_df.head())
 
-    # ตรวจสอบว่า UserID อยู่ใน Index หรือไม่
-    if id not in final_df.index:
-        return jsonify({"error": f"UserID {id} not found in preferences table"}), 404
-
-    # Content-Based Filtering (CBF)
+    # ===================== KNN (Content-Based Filtering) =====================
+    from sklearn.neighbors import NearestNeighbors
+    print("Running KNN for Content-Based Filtering...")
     cbf_knn = NearestNeighbors(metric='cosine', algorithm='brute')
-    cbf_knn.fit(final_df.values)
+    cbf_knn.fit(final_df.fillna(0).values)
+    distances, indices = cbf_knn.kneighbors(final_df.loc[[id]].fillna(0).values, n_neighbors=10)
 
-    # หาเพื่อนบ้านที่ใกล้ที่สุด (CBF)
-    cbf_distances, cbf_indices = cbf_knn.kneighbors(final_df.loc[[id]].values, n_neighbors=11)
-    cbf_recommended_user_ids = final_df.index[cbf_indices[0]].tolist()
-    cbf_distances = cbf_distances[0].tolist()
-    cbf_recommended_user_ids.remove(id)  # เอา UserID ของตัวเองออกจากผลลัพธ์
+    # ดึงผลลัพธ์จาก KNN
+    knn_users = final_df.index[indices[0]].tolist()
+    knn_users.remove(id)
+    recommended_users = list(set(knn_users))
+    print(f"Raw KNN Users: {recommended_users}")
 
-    # Collaborative Filtering (CF)
-    cf_recommended_user_ids = []
-    try:
-        sql_likes = '''
-        SELECT likerID, likedID
-        FROM userlike
+    # กรองเฉพาะผู้ใช้ที่มีเพศตรงกับ interest_gender
+    filtered_users = goal_gender_df[
+        (goal_gender_df['UserID'].isin(recommended_users)) &
+        (goal_gender_df['GenderID'] == interest_gender)
+    ]['UserID'].tolist()
+    recommended_users = filtered_users
+    print(f"Filtered Users by Gender: {recommended_users}")
+
+    # ===================== Fallback Rule-Based =====================
+    required_users = 5 - len(recommended_users)
+    print(f"Required users from Fallback: {required_users}")
+
+    if required_users > 0:
+        # เช็คว่ามี recommended_users หรือไม่
+        not_in_clause = f"AND u.UserID NOT IN ({', '.join(map(str, recommended_users))})" if recommended_users else ""
+
+        fallback_sql = f'''
+        SELECT DISTINCT u.UserID
+        FROM user u
+        LEFT JOIN matches m ON (m.user1ID = u.UserID AND m.user2ID = {id}) OR (m.user2ID = u.UserID AND m.user1ID = {id})
+        LEFT JOIN blocked_chats b ON (b.user1ID = {id} AND b.user2ID = u.UserID) OR (b.user2ID = {id} AND b.user1ID = {id})
+        WHERE u.UserID != {id}
+          {not_in_clause}  -- ไม่ใส่เงื่อนไขถ้า recommended_users เป็น empty
+          AND u.GenderID = {interest_gender}
+          AND (b.isBlocked IS NULL OR b.isBlocked = 0)
+          AND m.matchID IS NULL
+        LIMIT {required_users}
         '''
-        likes_df = pd.read_sql(sql_likes, conn)
-        likes_pivot = likes_df.pivot_table(index='likerID', columns='likedID', aggfunc='size', fill_value=0)
+        print(f"Generated Fallback SQL Query:\n{fallback_sql}")  # Debug
+        fallback_users = pd.read_sql(fallback_sql, conn)
+        print(f"Users fetched from Fallback: {fallback_users['UserID'].tolist()}")
 
-        if id in likes_pivot.index:
-            cf_knn = NearestNeighbors(metric='cosine', algorithm='brute')
-            cf_knn.fit(likes_pivot.values)
-            cf_distances, cf_indices = cf_knn.kneighbors(likes_pivot.loc[[id]].values, n_neighbors=11)
-            cf_recommended_user_ids = likes_pivot.index[cf_indices[0]].tolist()
-            cf_recommended_user_ids.remove(id)
-    except Exception as e:
-        print(f"CF Error: {str(e)} - Using CBF only.")
+        recommended_users.extend(fallback_users['UserID'].tolist())
 
-    # Hybrid Recommendation: รวมผลลัพธ์จาก CBF และ CF โดย CBF มาก่อน
-    combined_user_ids = cbf_recommended_user_ids  # เริ่มจาก CBF
-    if cf_recommended_user_ids:  # ถ้ามี CF เพิ่มเข้าไป
-        combined_user_ids = list(set(cbf_recommended_user_ids + cf_recommended_user_ids))
+    # ===================== รวมผลลัพธ์และจำกัดจำนวน =====================
+    recommended_users = list(set(recommended_users))[:5]
+    print(f"Final Recommended Users: {recommended_users}")
 
-    # จัดเรียงตามลำดับระยะทางจาก CBF (ใกล้ -> ไกล)
-    sorted_combined = sorted(
-        zip(cbf_recommended_user_ids, cbf_distances),
-        key=lambda x: x[1]
-    )
-    sorted_user_ids = [user_id for user_id, _ in sorted_combined]
+    # ===================== ดึงข้อมูลผู้ใช้ที่แนะนำ =====================
+    if not recommended_users:
+        print("No sufficient users found!")
+        return jsonify({"message": "No sufficient users found"}), 200
 
-    # ตรวจสอบว่ามีผลลัพธ์หรือไม่
-    if not sorted_user_ids:
-        return jsonify({"message": "No similar users found"}), 200
-
-    combined_user_ids_str = ', '.join(map(str, sorted_user_ids))
-
-    # ดึงข้อมูลผู้ใช้ที่แนะนำ
+    combined_user_ids_str = ', '.join(map(str, recommended_users))
     sql_query = f'''
     SELECT 
         u.UserID AS userID, 
-        u.nickname,         
+        u.nickname, 
         u.imageFile,
         u.verify
     FROM user u
-    LEFT JOIN matches m ON (m.user1ID = u.UserID AND m.user2ID = {id}) OR (m.user2ID = u.UserID AND m.user1ID = {id})
-    LEFT JOIN blocked_chats b ON (b.user1ID = {id} AND b.user2ID = u.UserID) OR (b.user2ID = {id} AND b.user1ID = u.UserID)
     WHERE u.UserID IN ({combined_user_ids_str})
-        AND m.matchID IS NULL
-        AND (b.isBlocked IS NULL OR b.isBlocked = 0)
-        AND u.GenderID = (SELECT interestGenderID FROM user WHERE UserID = {id})
-        AND u.interestGenderID = (SELECT GenderID FROM user WHERE UserID = {id})
     '''
-    recommended_users = pd.read_sql(sql_query, conn)
+    print(f"Final SQL Query to fetch user details:\n{sql_query}")
+    recommended_users_df = pd.read_sql(sql_query, conn)
     conn.close()
 
     # ปรับเส้นทางของ imageFile
-    for index, user in recommended_users.iterrows():
+    for index, user in recommended_users_df.iterrows():
         if user['imageFile']:
-            recommended_users.at[index, 'imageFile'] = f"http://{request.host}/ai_v2/user/{user['imageFile']}"
+            recommended_users_df.at[index, 'imageFile'] = f"http://{request.host}/ai_v2/user/{user['imageFile']}"
 
-    return jsonify(recommended_users[['userID', 'nickname', 'imageFile', 'verify']].to_dict(orient='records')), 200
+    print("Returning final response...")
+    return jsonify(recommended_users_df.to_dict(orient='records')), 200
+
 
 
 @app.route('/ai_v2/user/<filename>', methods=['GET'])
